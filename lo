@@ -1,0 +1,271 @@
+#!/bin/bash
+
+# Extract command name from path for cleaner help display
+COMMAND_NAME=$(basename "$0")
+
+show_help() {
+  echo "Usage: $COMMAND_NAME <request> [OPTIONS]"
+  echo ""
+  echo "  request              Term to search for (required)"
+  echo ""
+  echo "OPTIONS:"
+  echo "  -d                   Show description field"
+  echo "  -l, --limit NUM      Search limit (100-1000, default: 1000)"
+  echo "  --lang CODE          Language code (default: en)"
+  echo "  -t, --type FORMAT    Output type: json, short, html (default: json)"
+  echo "  -f, --file FILE      Read requests from file (one per line)"
+  echo "  -m, --multiple REQS  Multiple requests separated by newlines"
+  echo "  --bot-name NAME      Bot name in format @name"
+  echo "  --raw                Show raw API response without processing"
+  echo "  -h, --help           Show this help message"
+  echo ""
+  echo "EXAMPLES:"
+  echo "  $COMMAND_NAME \"john@example.com\""
+  echo "  $COMMAND_NAME \"Elon Musk\" --limit 500 --lang ru"
+  printf "  %s \"test\" --type short\n" "$COMMAND_NAME"
+  echo "  $COMMAND_NAME --multiple \"email@test.com\nJohn Doe\""
+  echo "  $COMMAND_NAME --file requests.txt"
+  exit 1
+}
+
+# Default values
+show_desc=false
+limit=1000
+lang="en"
+output_type="json"
+bot_name=""
+raw_output=false
+multiple_requests=""
+file_input=""
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -d)
+    show_desc=true
+    shift
+    ;;
+  -l | --limit)
+    limit="$2"
+    if [[ ! "$limit" =~ ^[0-9]+$ ]] || [ "$limit" -lt 100 ] || [ "$limit" -gt 1000 ]; then
+      echo "Error: Limit must be a number between 100 and 1000"
+      exit 1
+    fi
+    shift 2
+    ;;
+  --lang)
+    lang="$2"
+    shift 2
+    ;;
+  -t | --type)
+    output_type="$2"
+    case "$output_type" in
+    json | short | html) ;;
+    *)
+      echo "Error: Type must be json, short, or html"
+      exit 1
+      ;;
+    esac
+    shift 2
+    ;;
+  -f | --file)
+    file_input="$2"
+    if [ ! -f "$file_input" ]; then
+      echo "Error: File '$file_input' not found"
+      exit 1
+    fi
+    shift 2
+    ;;
+  -m | --multiple)
+    multiple_requests="$2"
+    shift 2
+    ;;
+  --bot-name)
+    bot_name="$2"
+    shift 2
+    ;;
+  --raw)
+    raw_output=true
+    shift
+    ;;
+  -h | --help)
+    show_help
+    ;;
+  -*)
+    echo "Error: Unknown option $1"
+    show_help
+    ;;
+  *)
+    if [ -z "$request" ]; then
+      request="$1"
+    else
+      echo "Error: Multiple positional arguments not allowed"
+      show_help
+    fi
+    shift
+    ;;
+  esac
+done
+
+# Validate input
+if [ -z "$request" ] && [ -z "$file_input" ] && [ -z "$multiple_requests" ]; then
+  echo "Error: Request parameter, file input, or multiple requests required"
+  show_help
+fi
+
+# Function to make API request
+make_api_request() {
+  local req_data="$1"
+  local api_token="${LEAKOSINT_API_KEY:-}"
+  if [ -z "$api_token" ]; then
+    echo "Error: LEAKOSINT_API_KEY environment variable is required" >&2
+    return 1
+  fi
+  local json_payload="{\"token\": \"$api_token\", \"request\": $req_data, \"lang\": \"$lang\", \"limit\": $limit, \"type\": \"$output_type\""
+
+  if [ -n "$bot_name" ]; then
+    json_payload="${json_payload}, \"bot_name\": \"$bot_name\""
+  fi
+
+  json_payload="${json_payload}}"
+
+  response=$(curl -s -X POST "https://leakosintapi.com" \
+    -H "Content-Type: application/json" \
+    -d "$json_payload")
+
+  # Check for API errors
+  if echo "$response" | jq -e '.["Error code"]' >/dev/null 2>&1; then
+    echo "API Error: $(echo "$response" | jq -r '.["Error code"]')" >&2
+    return 1
+  fi
+
+  echo "$response"
+}
+
+# Function to process JSON output
+process_json_output() {
+  local response="$1"
+
+  if [ "$raw_output" = true ]; then
+    echo "$response" | jq .
+    return
+  fi
+
+  # Check if response has the expected structure
+  if ! echo "$response" | jq -e '.List' >/dev/null 2>&1; then
+    echo "$response" | jq .
+    return
+  fi
+
+  if [ "$show_desc" = true ]; then
+    jq_query=".List | [to_entries[] | .key as \$source | .value.InfoLeak as \$desc | .value.Data[] | . + {source: \$source, description: \$desc}]"
+  else
+    jq_query=".List | [to_entries[] | .key as \$source | .value.InfoLeak as \$desc | .value.Data[] | . + {source: \$source} | del(.description)]"
+  fi
+
+  # Process main data without forced colors
+  echo "$response" | jq "$jq_query"
+
+  # Extract NumResults and display it at the bottom for better visibility
+  num_results=$(echo "$response" | jq -r '.NumResults // empty')
+  if [ -n "$num_results" ]; then
+    echo ""
+    echo "NumResults: $num_results"
+  fi
+}
+
+# Function to process short format output
+process_short_output() {
+  local response="$1"
+
+  if [ "$raw_output" = true ]; then
+    echo "$response" | jq .
+    return
+  fi
+
+  # Format short output with jq for better readability
+  if echo "$response" | jq -e '.' >/dev/null 2>&1; then
+    # Extract NumResults first
+    num_results=$(echo "$response" | jq -r '.NumResults // empty')
+
+    # Format the response with proper indentation, remove NumResults from main output
+    echo "$response" | jq 'del(.NumResults)'
+
+    # Display NumResults at the bottom for better visibility
+    if [ -n "$num_results" ]; then
+      echo ""
+      echo "NumResults: $num_results"
+    fi
+  else
+    echo "$response"
+  fi
+}
+
+# Main execution logic
+if [ -n "$file_input" ]; then
+  # Read requests from file
+  requests_array="["
+  first=true
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      if [ "$first" = true ]; then
+        first=false
+      else
+        requests_array="${requests_array},"
+      fi
+      requests_array="${requests_array}\"$(echo "$line" | sed 's/"/\\"/g')\""
+    fi
+  done <"$file_input"
+  requests_array="${requests_array}]"
+
+  response=$(make_api_request "$requests_array")
+  if [ $? -eq 0 ]; then
+    if [ "$output_type" = "json" ]; then
+      process_json_output "$response"
+    elif [ "$output_type" = "short" ]; then
+      process_short_output "$response"
+    else
+      echo "$response"
+    fi
+  fi
+elif [ -n "$multiple_requests" ]; then
+  # Handle multiple requests separated by newlines
+  requests_array="["
+  first=true
+  # Use process substitution to avoid subshell
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      if [ "$first" = true ]; then
+        first=false
+      else
+        requests_array="${requests_array},"
+      fi
+      requests_array="${requests_array}\"$(echo "$line" | sed 's/"/\\"/g')\""
+    fi
+  done < <(echo -e "$multiple_requests")
+  requests_array="${requests_array}]"
+
+  response=$(make_api_request "$requests_array")
+  if [ $? -eq 0 ]; then
+    if [ "$output_type" = "json" ]; then
+      process_json_output "$response"
+    elif [ "$output_type" = "short" ]; then
+      process_short_output "$response"
+    else
+      echo "$response"
+    fi
+  fi
+else
+  # Single request
+  escaped_request=$(echo "$request" | sed 's/"/\\"/g')
+  response=$(make_api_request "\"$escaped_request\"")
+  if [ $? -eq 0 ]; then
+    if [ "$output_type" = "json" ]; then
+      process_json_output "$response"
+    elif [ "$output_type" = "short" ]; then
+      process_short_output "$response"
+    else
+      echo "$response"
+    fi
+  fi
+fi
